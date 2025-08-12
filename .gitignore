@@ -1,0 +1,23 @@
+# Python
+venv/
+spacy-env/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.cache/
+.pytest_cache/
+
+# macOS
+.DS_Store
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Data (keep private docs out)
+uploaded_files/
+data/*.pdf
+data/*.docx
+data/*.json
+!data/README.md

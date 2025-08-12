@@ -1,0 +1,425 @@
+from sentence_transformers import SentenceTransformer
+from PyPDF2 import PdfReader
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
+from pathlib import Path
+import faiss
+import docx
+import re
+import spacy
+import os
+from typing import Optional, List
+REG_TRIGGER_WORDS = {
+    "regulation","regulations","clause","section","statute",
+    "8 cfr","cfr","code of federal regulations","ina","§","section"
+}
+
+# matches: "8 CFR 214.2(h)(2)(i)(B)" / "8 C.F.R. §214.2(h)(2)(i)(B)" / "INA §214" / "§ 214.2(h)"
+REGEX_REGULATION = re.compile(
+    r"""(?ix)
+    (?:\b(?:8\s*\.?\s*c\.?f\.?r\.?|cfr)\b \s* [§]?\s* [\d\.]+ [\w\(\)\.-]*)
+    |(?:\bina\b \s* [§]\s* [\d\.]+ [\w\(\)\.-]*)
+    |(?:[§]\s*[\d\.]+[\w\(\)\.-]*)
+    """.strip(),
+)
+
+APPROVED_TOKENS = {
+    "approved", "approval notice", "i-797 approval", "petition approved", "h-1b approved"
+}
+DENIED_TOKENS = {
+    "denied", "petition denied", "decision: denied", "notice of denial"
+}
+RFE_TOKENS = {
+    "request for evidence", "rfe", "r.f.e."
+}
+
+def _detect_outcome(text: str) -> Optional[str]:
+
+    t = text.lower()
+    # a few guardrails to avoid false positives
+    if any(tok in t for tok in DENIED_TOKENS):
+        return "denied"
+    if any(tok in t for tok in APPROVED_TOKENS):
+        return "approved"
+    if any(tok in t for tok in RFE_TOKENS):
+        return "rfe"
+    return None
+
+nlp = spacy.load("en_core_web_sm")
+from transformers import pipeline
+
+summarizer = pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
+qa_pipeline = pipeline("question-answering", model="distilbert-base-cased-distilled-squad")
+
+
+model = SentenceTransformer("all-MiniLM-L6-v2")
+
+# Shared state
+documents = []
+embeddings = []
+
+# Correct path to ../data folder
+DATA_PATH = Path(__file__).resolve().parent.parent / "data"
+def is_regulation_query(q: str) -> bool:
+    qn = q.lower()
+    return any(t in qn for t in REG_TRIGGER_WORDS)
+def filter_chunks_for_regulations(chunks: list[str]) -> list[str]:
+    kept = []
+    for ch in chunks:
+        if REGEX_REGULATION.search(ch):
+            kept.append(ch)
+    return kept
+
+def load_documents():
+    if not DATA_PATH.exists():
+        print("❌ Data folder not found:", DATA_PATH)
+        return
+
+    for file in DATA_PATH.iterdir():
+        if file.suffix == ".pdf":
+            reader = PdfReader(str(file))
+            for page in reader.pages:
+                text = page.extract_text()
+                if text:
+                    chunks = split_text(text)
+                    for chunk in chunks:
+                        documents.append((file.name, chunk))
+                        embeddings.append(model.encode(chunk))
+
+        elif file.suffix == ".docx":
+            doc = docx.Document(str(file))
+            full_text = "\n".join([p.text for p in doc.paragraphs])
+            if full_text.strip():
+                chunks = split_text(full_text)
+                for chunk in chunks:
+                    documents.append((file.name, chunk))
+                    embeddings.append(model.encode(chunk))
+
+def split_text(text, max_tokens=80):
+    """
+    Split text into clean, meaningful chunks using SpaCy sentence segmentation and chunk grouping.
+    Each chunk contains up to ~80 tokens, grouped by sentences.
+    """
+    doc = nlp(text)
+    chunks = []
+    current_chunk = ""
+    current_len = 0
+
+    for sent in doc.sents:
+        sentence = sent.text.strip().replace("\n", " ")
+        sent_len = len(sentence.split())
+
+        # If sentence is too short, skip it
+        if sent_len < 5:
+            continue
+
+        # If adding this sentence exceeds max_tokens, flush current chunk
+        if current_len + sent_len > max_tokens:
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+            current_chunk = sentence
+            current_len = sent_len
+        else:
+            current_chunk += " " + sentence
+            current_len += sent_len
+
+    # Append the last chunk
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+
+    return chunks
+
+
+def build_faiss_index():
+    if not embeddings:
+        return None
+    dim = len(embeddings[0])
+    index = faiss.IndexFlatL2(dim)
+    index.add(np.array(embeddings).astype("float32"))
+    return index
+
+def extract_named_entities(text):
+    doc = nlp(text)
+    return [(ent.text, ent.label_) for ent in doc.ents]
+
+import re
+
+def extract_regulations(text):
+    """
+    Extract regulation or clause references from legal documents.
+    Matches formats like '8 CFR §214.2(h)(13)(i)(A)' or 'INA § 101(a)(15)(H)(i)(b)'.
+    """
+    # Combined pattern to match both CFR and INA formats
+    pattern = r"\b(?:8\s*CFR|8CFR)\s*(?:§|Section)?\s*\d+(?:\.\d+)*(?:\([a-zA-Z0-9]+\))*|\bINA\s*§\s*\d+(?:\([a-zA-Z0-9]+\))*"
+
+    # ✅ Use re.finditer instead of findall to get the full match
+    matches = re.finditer(pattern, text, re.IGNORECASE)
+    
+    # Return unique cleaned results
+    return list(set([match.group().strip() for match in matches]))
+
+
+def summarize_text(text):
+    try:
+        result = summarizer(text[:3000], max_length=180, min_length=60, do_sample=False)[0]['summary_text']
+        return result.strip()
+    except:
+        return "⚠️ Could not generate summary due to input length or error."
+
+
+def format_answer(answer, context):
+    """
+    Format the final answer and context into clean markdown style.
+    """
+    answer = answer.strip().capitalize().rstrip(".") + "."
+    context = re.sub(r'\s+', ' ', context.strip())[:300].strip().rsplit(".", 1)[0] + "."
+    return f"✅ **Answer:** {answer}\n📄 *Context:* {context}"
+
+
+def answer_from_chunks(question, chunks):
+    best_answer = None
+    best_score = 0.0
+    best_context = ""
+    question_lower = question.lower()
+    normalized_q = re.sub(r'[^\w\s]', '', question_lower)
+    # 4️⃣ Run QA across chunks
+    for chunk in chunks:
+        if len(chunk.strip()) < 20:
+            continue
+        try:
+            result = qa_pipeline({'question': question, 'context': chunk})
+            answer = result['answer'].strip()
+
+            if len(answer.split()) < 4:
+                continue
+            if answer[-1] not in ".!?":
+                answer += "."
+
+            if result['score'] > 0.25 and result['score'] > best_score:
+                best_answer = answer
+                best_score = result['score']
+                best_context = chunk
+
+        except Exception:
+            continue
+    if best_answer:
+        short_context = re.sub(r'\s+', ' ', best_context.strip())[:300].strip().rsplit(".", 1)[0] + "."
+        final_answer = best_answer.strip().capitalize().rstrip(".") + "."
+
+        return f"""✅ **Answer:** {final_answer}\n📄 *Context:* {short_context}"""
+
+
+
+    # 1️⃣ Regulation/Clause extraction (keep this early for performance)
+    if "regulation" in normalized_q or "clause" in normalized_q:
+        all_text = " ".join(chunks)
+        regs = extract_regulations(all_text)
+        context = next((c for c in chunks if any(r in c for r in regs)), "")
+        context_preview = " ".join(context.strip().split(".")[:2]).strip()
+        if regs:
+            bold_regs = [f"**{r}**" for r in regs]
+            return f"✅ Answer: Regulation(s) cited: {', '.join(bold_regs)}\n\n> 🧾 *Context:* {context_preview}..."
+        else:
+            return "⚠️ No regulation or clause found."
+
+    # ✅ Handle approval-related questions
+    if "approval" in normalized_q or "approved" in normalized_q or "granted" in normalized_q:
+        for chunk in chunks:
+            chunk_l = chunk.lower()
+
+
+            if any(kw in chunk_l for kw in ["approval", "approved", "granted", "visa issued", "i-797", "notice of approval"]):
+                return format_answer("The petition was approved", chunk)
+
+
+    # 2️⃣ Combined pass for keyword-based logic
+    # 1.5️⃣ Entity extraction for who/when/where type questions
+    if any(x in normalized_q for x in ["who", "when", "where", "location", "filed", "petitioner", "employer", "worksite"]):
+        entity_results = []
+
+        for chunk in chunks:
+            entities = extract_named_entities(chunk)
+            for ent_text, ent_label in entities:
+                if "who" in normalized_q and ent_label in ["PERSON", "ORG"] and len(ent_text.split()) <= 5:
+                    entity_results.append(ent_text.strip())
+                elif "when" in normalized_q and ent_label == "DATE":
+                    entity_results.append(ent_text.strip())
+                elif "where" in normalized_q and ent_label in ["GPE", "LOC", "ORG"]:
+                    entity_results.append(ent_text.strip())
+
+        entity_results = list(set(entity_results))  # remove duplicates
+        if entity_results:
+            return f"""✅ **Answer:** {', '.join(entity_results[:3])}"""  # limit to 3 items
+
+    # 2️⃣ Combined pass for multi-match keyword logic
+    keyword_matches = []
+
+    # 2️⃣ Combined pass for multi-match keyword logic (one best match per chunk)
+    if any(x in normalized_q for x in ["education", "academic", "evidence", "denied", "why", "support letter", "expert", "evaluation"]):
+        seen_chunks = set()
+
+        for chunk in chunks:
+            chunk_l = chunk.lower()
+            current_reason = None
+
+            # 🎓 Education-related
+            if ("education" in normalized_q or "academic" in normalized_q) and \
+                any(kw in chunk_l for kw in ["degree", "field of study", "education"]):
+                current_reason = format_answer("The petition was flagged due to academic mismatch or unrelated degree", chunk)
+
+            # 📑 Evidence-related
+            elif "evidence" in normalized_q and \
+                any(kw in chunk_l for kw in ["lack of", "did not provide", "missing", "no evidence", "failure to submit"]):
+                current_reason = format_answer("The following evidence was missing", chunk)
+
+            # ❌ Denial Reason
+            elif ("why" in normalized_q or "denied" in normalized_q) and \
+                any(kw in chunk_l for kw in ["denied", "failure to", "lack of", "did not", "not met", "unable to"]):
+
+                denial_match = re.search(r"([^.]*?(denied|failure to|lack of|did not|not met|unable to)[^.]*\.)", chunk, re.IGNORECASE)
+
+                if denial_match:
+                    raw_reason = denial_match.group(1).strip()
+
+                    # Clean boilerplate or repeated phrases
+                    clean_reason = re.sub(
+                    r"(conclusion:|based on|due to|uscis concludes that|uscis determines|therefore|it was determined that|it appears that|decision notice petition:|petitioner:)", 
+                    "", 
+                    raw_reason, 
+                    flags=re.IGNORECASE
+                    ).strip()
+
+                    clean_reason = clean_reason[0].upper() + clean_reason[1:] if clean_reason else "Unspecified reason."
+                    readable_sentence = f"The petition was denied because {clean_reason.rstrip('.')}."
+
+                    keyword_matches.append(format_answer(readable_sentence, chunk))
+
+            # 👨‍⚖️ Support Letter
+            elif any(kw in normalized_q for kw in ["support letter", "expert", "evaluation"]) and \
+                any(kw in chunk_l for kw in ["support letter", "evaluation"]):
+                current_reason = format_answer("A support or expert letter was present", chunk)
+
+            # If a match was found, add only the first relevant match from this chunk
+            if current_reason and chunk not in seen_chunks:
+                seen_chunks.add(chunk)
+                return current_reason  # ✅ Return the first solid match
+
+
+
+
+    # 3️⃣ Similar approval shortcut
+    if "similar approval" in normalized_q or "past approval" in normalized_q:
+        for chunk in chunks:
+            if "previously approved" in chunk.lower() or "similar petition" in chunk.lower():
+                return f"✅ **Answer:** A similar petition was previously approved.\n📄 *Context:* {chunk.strip()[:250]}..."
+        return "⚠️ No mention of similar past approvals found."
+
+
+    return "⚠️ *No confident answer found in the documents.*"
+
+
+def get_top_k_chunks(query, k=8):
+    # Clean query before embedding
+    doc_q = nlp(query)
+    important_parts = [chunk.text for chunk in doc_q.noun_chunks] + [ent.text for ent in doc_q.ents]
+    cleaned_query = " ".join(important_parts) if important_parts else query
+
+    qv = model.encode(cleaned_query).reshape(1, -1)
+    D, I = faiss_index.search(np.array(qv).astype("float32"), k=min(k, len(documents)))
+
+    # Collect (filename, chunk, score)
+    scored = []
+    for idx, score in zip(I[0], D[0]):
+        filename, chunk = documents[idx]
+        # lower L2 distance = better → apply “boosts” by shrinking distance
+        if any(part in filename.lower() for part in query.lower().split()):
+            score *= 0.8
+        if any(key in filename.lower() for key in ["support", "petition", "response", "denial", "approval", "rfe", "letter"]):
+            score *= 0.85
+        scored.append((filename, chunk, float(score)))
+
+    # Group by file, keep best k chunks per file (lowest distance)
+    by_file = {}
+    for fn, ch, sc in scored:
+        by_file.setdefault(fn, []).append((sc, ch))
+    for fn in by_file:
+        by_file[fn].sort(key=lambda x: x[0])
+        by_file[fn] = [ch for _, ch in by_file[fn][:k]]
+
+    # Order files by their best score (lowest distance first)
+    best_per_file = {}
+    for fn, ch, sc in scored:
+        best_per_file[fn] = min(sc, best_per_file.get(fn, sc))
+    ordered_files = sorted(best_per_file.items(), key=lambda x: x[1])
+
+    # FINAL RETURN: list of (filename, [chunks...]) in ranked order
+    return [(fn, by_file[fn]) for fn, _ in ordered_files]
+
+
+
+
+def ask_question(query):
+    print("USER QUESTION:", query)
+    normalized_q = re.sub(r'[^\w\s]', '', query.lower())
+
+    if not embeddings:
+        return "❌ No documents indexed. Please upload and refresh first."
+
+    # Step 1: ranked files with their top chunks
+    results_by_file = get_top_k_chunks(query, k=10)  # <-- LIST of (filename, [chunks])
+
+    # Step 2: extract named entities (PERSON/ORG) from the question
+    ents = [ent.text.strip() for ent in nlp(query).ents if ent.label_ in ("PERSON", "ORG")]
+    ent_norm = [e for e in ents if e]
+
+    # Step 3: if entities are present, filter to files that mention them
+    if ent_norm:
+        filtered = [(fn, chs) for (fn, chs) in results_by_file if _mentions_any_entity(" ".join(chs), ent_norm)]
+        if not filtered:
+            return f"❌ No documents mention {', '.join(ents)}."
+        results_by_file = filtered
+
+    # Step 4: answer — stop after the first solid hit if the user named an entity
+    response = "### 📌 Answer by Document:\n\n"
+    answered = False
+
+    for filename, chunks in results_by_file:
+        # Summary mode (user explicitly asked to summarize)
+        if "summarize" in normalized_q or "summary" in normalized_q:
+            joined = " ".join(chunks)
+            summary = summarize_text(joined)
+            response += f"**📄 {filename}**\n- ✅ *Summary:*\n\n{summary}\n\n"
+            answered = True
+            if ent_norm:
+                break
+            continue
+
+        # Standard QA
+        answer = answer_from_chunks(query, chunks)
+
+        # Skip weak/no answers
+        if answer.strip().startswith("⚠️ No confident") and "**Answer:**" not in answer:
+            continue
+
+        # Avoid duplicating the green prefix if present
+        clean = answer.replace("✅ **Answer:**", "").strip()
+        response += f"**📄 {filename}**\n\n✅ **Answer:** {clean}\n\n"
+        answered = True
+
+        # If question mentions a specific entity (company/person), stop after first solid hit
+        if ent_norm:
+            break
+
+    if not answered:
+        return "❌ No relevant information found in the documents."
+
+    return response
+
+
+
+
+# Only run these on startup
+load_documents()
+print("SAMPLE DOCUMENT CHUNKS:", documents[:2])
+print("SAMPLE EMBEDDINGS:", embeddings[:2])
+faiss_index = build_faiss_index()

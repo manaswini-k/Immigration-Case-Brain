@@ -1,0 +1,7 @@
+[theme]
+base = "dark"
+primaryColor = "#7C3AED"        # violet-600
+backgroundColor = "#0B1020"     # deep navy
+secondaryBackgroundColor = "#0F162E"  # panel bg
+textColor = "#E6E9F2"
+font = "sans serif"

@@ -1,0 +1,61 @@
+import streamlit as st
+from qa_engine import ask_question, load_documents, build_faiss_index, documents, embeddings
+import os
+
+# Use correct relative path to data folder
+DATA_DIR = os.path.join("..", "data")
+
+st.set_page_config(page_title="Immigration Case Brain", layout="centered")
+
+# 📚 Show list of uploaded PDFs
+with st.sidebar:
+    st.markdown("### 📚 Uploaded Files")
+    if not os.path.exists(DATA_DIR):
+        os.makedirs(DATA_DIR)
+    pdf_list = [pdf for pdf in os.listdir(DATA_DIR) if not pdf.startswith('.')]
+
+    if pdf_list:
+        for pdf in pdf_list:
+            st.write(f"📄 {pdf}")
+    else:
+        st.write("No documents uploaded yet.")
+
+st.title("🧠 Immigration Case Brain")
+st.write("Ask questions based on immigration case files (RFEs, Denials, Memos, etc.)")
+
+# 🧾 Upload Section
+st.markdown("#### 📤 Upload a new immigration PDF (optional)")
+uploaded_file = st.file_uploader("Upload Document", type=["pdf", "docx"])
+
+if uploaded_file is not None:
+    file_path = os.path.join(DATA_DIR, uploaded_file.name)
+    with open(file_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+    st.success(f"{uploaded_file.name} uploaded successfully!")
+
+    # ⏳ Refresh embeddings immediately
+    documents.clear()
+    embeddings.clear()
+    load_documents()
+    faiss_index = build_faiss_index()
+    st.success("📚 Document indexed. You can now search it immediately!")
+
+# 🔍 Ask Question
+query = st.text_input("Enter your legal question:")
+
+if query:
+    with st.spinner("Thinking..."):
+        answer = ask_question(query)
+        st.markdown("### 🔍 Most Relevant Chunks:")
+        st.markdown(
+            f"<div style='white-space: pre-wrap; word-wrap: break-word;'>{answer}</div>",
+            unsafe_allow_html=True
+        )
+
+
+# Optional Dev Button
+if st.button("🔎 Extract Named Entities (DEV)"):
+    for filename, chunk in documents:
+        ents = extract_named_entities(chunk)
+        if ents:
+            st.markdown(f"**📄 {filename}** — {ents}")
