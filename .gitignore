@@ -213,6 +213,7 @@ __marimo__/
 
 # Python
 venv/
+spacy-env/
 __pycache__/
 *.pyc
 *.pyo
@@ -224,12 +225,17 @@ __pycache__/
 # macOS
 .DS_Store
 
-# Streamlit
+# Editors
+.vscode/
+
+# Streamlit secrets
 .streamlit/secrets.toml
 
-# Data (keep private docs out)
+# Runtime uploads (don’t commit user uploads)
+app/uploaded_files/
 uploaded_files/
 data/*.pdf
 data/*.docx
 data/*.json
 >>>>>>> f5e69091749bbf33da0f2926a4b3502d119252b3
+Screen Recording*.mov
