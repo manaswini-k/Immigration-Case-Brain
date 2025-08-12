@@ -67,15 +67,24 @@ Extract Answer – Pulls the top matches and formats them into a clean answer (w
 Show Results – Displays the answer, source file, and snippets in the Streamlit UI.
 
 ->Run It Locally
-bash
-Copy
-Edit
-# 1. Create and activate a virtual environment
-python3 -m venv venv
-source venv/bin/activate
+# 1. Create and activate the conda environment (name it spacy for consistency)
+conda create -n spacy python=3.10 -y
+conda activate spacy
 
-# 2. Install dependencies
+# 2. Install Python dependencies
 pip install -r requirements.txt
+
+# 3. Install faiss separately (since it’s not always installed cleanly from requirements.txt)
+pip install faiss-cpu
+
+# 4. Download the spaCy model
+python -m spacy download en_core_web_sm
+
+# 5. (Optional) Verify installation
+python -c "import faiss, spacy; print('FAISS version:', faiss.__version__); print('spaCy version:', spacy.__version__)"
+
+# 6. Start the Streamlit app
+streamlit run app/main.py
 
 # 3. Download spaCy model
 python -m spacy download en_core_web_sm
