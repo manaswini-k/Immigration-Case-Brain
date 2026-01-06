@@ -1,6 +1,6 @@
 Immigration Case Brain
 Immigration Case Brain is a simple Streamlit app I built to help quickly search through immigration-related case files like H-1B RFEs, denial notices, support letters, and petitions.
-You can upload your documents, ask a question in plain English, and get an answer that’s pulled directly from the relevant parts of the file — all without relying on paid APIs.
+You can upload your documents, ask a question in plain English, and get an answer that’s pulled directly from the relevant parts of the file all without relying on paid APIs.
 
 ->Sample Data
 Inside the data/ folder, you’ll find a few redacted sample documents to try it out:
